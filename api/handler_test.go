@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/tamer-uz/order-state-machine/completion"
 	"github.com/tamer-uz/order-state-machine/models"
@@ -15,12 +17,14 @@ import (
 
 // newTestServer wires a handler with stubs configured for one scenario.
 func newTestServer(authFails, completionFails, voidFails bool) *httptest.Server {
-	h := New(
+	return serve(New(
 		storage.New(),
 		&payment.Stub{AuthorizeFails: authFails, VoidFails: voidFails},
 		&completion.Stub{Fails: completionFails},
-	)
+	))
+}
 
+func serve(h *Handler) *httptest.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /orders", h.CreateOrder)
 	mux.HandleFunc("GET /orders/{id}", h.GetOrder)
@@ -29,23 +33,34 @@ func newTestServer(authFails, completionFails, voidFails bool) *httptest.Server 
 	return httptest.NewServer(mux)
 }
 
-func post(t *testing.T, url string, body any) (int, models.Order) {
-	t.Helper()
-
+// postStatus returns transport errors rather than failing the test, so it is
+// safe to call from a goroutine. t.Fatalf outside the test goroutine calls
+// runtime.Goexit on the wrong stack and hangs the run instead of failing it.
+func postStatus(url string, body any) (int, models.Order, error) {
 	payload, err := json.Marshal(body)
 	if err != nil {
-		t.Fatalf("marshal: %v", err)
+		return 0, models.Order{}, err
 	}
 
 	resp, err := http.Post(url, "application/json", bytes.NewReader(payload))
 	if err != nil {
-		t.Fatalf("post %s: %v", url, err)
+		return 0, models.Order{}, err
 	}
 	defer resp.Body.Close()
 
 	var order models.Order
 	json.NewDecoder(resp.Body).Decode(&order)
-	return resp.StatusCode, order
+	return resp.StatusCode, order, nil
+}
+
+func post(t *testing.T, url string, body any) (int, models.Order) {
+	t.Helper()
+
+	status, order, err := postStatus(url, body)
+	if err != nil {
+		t.Fatalf("post %s: %v", url, err)
+	}
+	return status, order
 }
 
 func get(t *testing.T, url string) (int, models.Order) {
@@ -72,11 +87,19 @@ func createOrder(t *testing.T, srv *httptest.Server) models.Order {
 	return order
 }
 
+func sendCommandStatus(srv *httptest.Server, id string, command models.Command) (int, models.Order, error) {
+	return postStatus(srv.URL+"/orders/"+id+"/transitions",
+		map[string]models.Command{"command": command})
+}
+
 func sendCommand(t *testing.T, srv *httptest.Server, id string, command models.Command) (int, models.Order) {
 	t.Helper()
 
-	return post(t, srv.URL+"/orders/"+id+"/transitions",
-		map[string]models.Command{"command": command})
+	status, order, err := sendCommandStatus(srv, id, command)
+	if err != nil {
+		t.Fatalf("send %q: %v", command, err)
+	}
+	return status, order
 }
 
 // assertReasonRecorded checks a failure was surfaced rather than swallowed.
@@ -231,8 +254,9 @@ func TestGetOrderReturnsCurrentStateAndHistory(t *testing.T) {
 	if fetched.CurrentState != models.PaymentAuthorized {
 		t.Errorf("state = %q, want %q", fetched.CurrentState, models.PaymentAuthorized)
 	}
-	if len(fetched.StateTransitionHistory) != 2 {
-		t.Errorf("history has %d entries, want 2", len(fetched.StateTransitionHistory))
+	// initialized, authorizing, payment_authorized
+	if len(fetched.StateTransitionHistory) != 3 {
+		t.Errorf("history has %d entries, want 3", len(fetched.StateTransitionHistory))
 	}
 }
 
@@ -244,5 +268,128 @@ func TestGetUnknownOrderReturnsNotFound(t *testing.T) {
 
 	if status != http.StatusNotFound {
 		t.Errorf("status = %d, want %d", status, http.StatusNotFound)
+	}
+}
+
+// countingPayment records how many times the provider was actually reached.
+type countingPayment struct {
+	mu         sync.Mutex
+	authorized int
+}
+
+func (p *countingPayment) Authorize(orderID string, cents int) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.authorized++
+	return nil
+}
+
+func (p *countingPayment) Void(orderID string) error { return nil }
+
+func (p *countingPayment) count() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.authorized
+}
+
+// barrierStore holds the first want readers inside GetOrder until all of them
+// have read, so every caller leaves the read with the same stale order. That is
+// the interleaving a conditional write has to defeat; relying on timing to
+// produce it does not work, because the read and the claim are microseconds
+// apart and the requests end up serialising by luck.
+type barrierStore struct {
+	*storage.Store
+
+	want    int
+	release chan struct{}
+	mu      sync.Mutex
+	arrived int
+}
+
+func newBarrierStore(want int) *barrierStore {
+	return &barrierStore{
+		Store:   storage.New(),
+		want:    want,
+		release: make(chan struct{}),
+	}
+}
+
+func (s *barrierStore) GetOrder(id string) (models.Order, bool) {
+	order, found := s.Store.GetOrder(id)
+
+	s.mu.Lock()
+	arrived := s.arrived
+	if arrived < s.want {
+		s.arrived++
+	}
+	s.mu.Unlock()
+
+	switch {
+	case arrived == s.want-1:
+		close(s.release)
+	case arrived < s.want-1:
+		select {
+		case <-s.release:
+		case <-time.After(5 * time.Second):
+			panic("barrierStore: not all readers arrived")
+		}
+	}
+	return order, found
+}
+
+func TestConcurrentAuthorizeChargesOnce(t *testing.T) {
+	const callers = 20
+
+	provider := &countingPayment{}
+	srv := serve(New(newBarrierStore(callers), provider, &completion.Stub{}))
+	defer srv.Close()
+
+	order := createOrder(t, srv)
+
+	statuses := make([]int, callers)
+	errs := make([]error, callers)
+
+	var wg sync.WaitGroup
+	for i := range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			statuses[i], _, errs[i] = sendCommandStatus(srv, order.ID, models.AuthorizePayment)
+		}()
+	}
+	wg.Wait()
+
+	// Reported here, not in the goroutines, for the reason postStatus documents.
+	for _, err := range errs {
+		if err != nil {
+			t.Fatalf("authorize: %v", err)
+		}
+	}
+
+	var ok, conflict int
+	for _, status := range statuses {
+		switch status {
+		case http.StatusOK:
+			ok++
+		case http.StatusConflict:
+			conflict++
+		default:
+			t.Errorf("unexpected status %d", status)
+		}
+	}
+
+	if ok != 1 {
+		t.Errorf("%d callers got 200, want exactly 1", ok)
+	}
+	if conflict != callers-1 {
+		t.Errorf("%d callers got 409, want %d", conflict, callers-1)
+	}
+	if got := provider.count(); got != 1 {
+		t.Errorf("provider authorized %d times, want 1", got)
+	}
+
+	_, fetched := get(t, srv.URL+"/orders/"+order.ID)
+	if fetched.CurrentState != models.PaymentAuthorized {
+		t.Errorf("final state = %q, want %q", fetched.CurrentState, models.PaymentAuthorized)
 	}
 }

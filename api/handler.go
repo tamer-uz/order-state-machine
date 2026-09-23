@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 
@@ -87,10 +88,28 @@ func (h *Handler) ProcessTransition(w http.ResponseWriter, r *http.Request) {
 }
 
 // State is checked first: never charge a card we can't record the result on.
+//
+// Two mechanisms, each covering what the other cannot. Claiming the order into
+// authorizing is what keeps a second request away from the provider; saving
+// that claim conditionally is what stops two requests from both winning it.
 func (h *Handler) authorizePayment(w http.ResponseWriter, order models.Order) {
 	if order.CurrentState != models.Initialized {
 		writeError(w, http.StatusConflict,
 			fmt.Sprintf("cannot authorize payment from state %q", order.CurrentState))
+		return
+	}
+
+	// order is our own copy; nothing is visible to other requests until the save.
+	if !h.apply(w, &order, models.EnteringAuthorization, nil) {
+		return
+	}
+	if err := h.store.SaveIfStateIs(models.Initialized, order); err != nil {
+		if errors.Is(err, models.ErrStateChanged) {
+			writeError(w, http.StatusConflict,
+				"cannot authorize payment: order state changed concurrently")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -104,6 +123,8 @@ func (h *Handler) authorizePayment(w http.ResponseWriter, order models.Order) {
 		return
 	}
 
+	// Unconditional: the claim above is a lock, and nothing else can leave
+	// authorizing, so no other request can have written since.
 	h.store.UpsertOrder(order)
 	writeJSON(w, http.StatusOK, order)
 }
