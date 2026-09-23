@@ -11,8 +11,9 @@ func TestProcessTransitionValid(t *testing.T) {
 		event Event
 		want  State
 	}{
-		{Initialized, PaymentSucceeded, PaymentAuthorized},
-		{Initialized, PaymentFailed, Rejected},
+		{Initialized, EnteringAuthorization, Authorizing},
+		{Authorizing, PaymentSucceeded, PaymentAuthorized},
+		{Authorizing, PaymentFailed, Rejected},
 		{PaymentAuthorized, CompletionSucceeded, Complete},
 		{PaymentAuthorized, CompletionFailed, VoidPending},
 		{VoidPending, VoidSucceeded, Cancelled},
@@ -46,6 +47,7 @@ func TestProcessTransitionValid(t *testing.T) {
 func TestProcessTransitionTerminalStatesRejectEverything(t *testing.T) {
 	terminal := []State{Complete, Rejected, Cancelled, NeedsAttention}
 	events := []Event{
+		EnteringAuthorization,
 		PaymentSucceeded, PaymentFailed,
 		CompletionSucceeded, CompletionFailed,
 		VoidSucceeded, VoidFailed,
@@ -86,7 +88,7 @@ func TestProcessTransitionRecordsReason(t *testing.T) {
 }
 
 func TestProcessTransitionOmitsReasonOnSuccess(t *testing.T) {
-	order := Order{CurrentState: Initialized}
+	order := Order{CurrentState: Authorizing}
 
 	if err := order.ProcessTransition(PaymentSucceeded, nil); err != nil {
 		t.Fatalf("unexpected error: %v", err)

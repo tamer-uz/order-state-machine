@@ -6,6 +6,11 @@ import "github.com/tamer-uz/order-state-machine/models"
 type OrderStore interface {
 	GetOrder(id string) (models.Order, bool)
 	UpsertOrder(o models.Order)
+
+	// SaveIfStateIs writes o only if the stored copy is still in expected,
+	// wrapping models.ErrStateChanged if it is not. Read-then-write callers
+	// use it so no other request can interleave between the two.
+	SaveIfStateIs(expected models.State, o models.Order) error
 }
 
 // PaymentProvider is the external payment system.
