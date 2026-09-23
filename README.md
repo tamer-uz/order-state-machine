@@ -14,8 +14,10 @@ A decline costs nothing to undo. A completion failure after authorization has to
 stateDiagram-v2
     [*] --> initialized
 
-    initialized --> payment_authorized: payment_succeeded
-    initialized --> rejected: payment_failed
+    initialized --> authorizing: entering_authorization
+
+    authorizing --> payment_authorized: payment_succeeded
+    authorizing --> rejected: payment_failed
 
     payment_authorized --> complete: completion_succeeded
     payment_authorized --> void_pending: completion_failed
@@ -94,6 +96,10 @@ Under `void_failure` the final `GET` returns:
             "timestamp": "2026-08-23T09:42:43.6554832-04:00"
         },
         {
+            "state": "authorizing",
+            "timestamp": "2026-08-23T09:42:43.6554901-04:00"
+        },
+        {
             "state": "payment_authorized",
             "timestamp": "2026-08-23T09:43:21.7231206-04:00"
         },
@@ -122,6 +128,7 @@ Clients send **commands**, not events. The service performs the operation and de
 
 Events, all internal:
 
+* `entering_authorization`
 * `payment_succeeded`
 * `payment_failed`
 * `completion_succeeded`
@@ -143,12 +150,16 @@ api/         handlers, and the interfaces they depend on
 
 `api/handler_test.go` covers the four scenarios end to end with stubs injected per case: happy path, payment decline, completion failure with a successful void, and completion failure with a failed void.
 
-`models/order_test.go` covers the state machine in isolation.
+`models/order_test.go` covers the state machine in isolation, and `storage/store_test.go` covers the conditional write.
+
+`TestConcurrentAuthorizeChargesOnce` runs twenty simultaneous `authorize_payment` calls against one order and asserts the provider is reached once. It holds every caller inside `GetOrder` until all of them have read, so the stale-read interleaving is guaranteed rather than hoped for.
 
 ## Tradeoffs and what I'd do next
 
 **Synchronous model.** Every provider outcome is known immediately. Real authorization is asynchronous, so `initialized` is really a state awaiting a callback that may be duplicated, delayed, or lost. That needs pending states, idempotency keys, a timeout sweeper, and reconciliation against the provider before deciding an order failed.
 
-**Read modify write is not atomic.** The handler reads an order, mutates it, and writes it back with the store lock released in between. Two concurrent commands could both read `payment_authorized` and both proceed. The fix is a conditional write, which depends on the persistence layer, so it belongs with the real store.
+**Read modify write is only atomic on one path.** `authorize_payment` claims the order into `authorizing` with a conditional write, so two concurrent calls cannot both reach the payment provider. `complete_order` has no such guard: it reads, mutates and writes back with the store lock released in between, so two concurrent calls could both read `payment_authorized` and both reach the completion provider. `SaveIfStateIs` is the tool for it; applying it there is the next step.
+
+**An order can get stuck in `authorizing`.** If the process dies between the claim and the provider result, nothing moves the order out and every later command rejects it. It needs a timeout sweeper that reconciles against the provider before deciding what the order should become. Note that such a sweeper also makes the unconditional write at the end of `authorizePayment` unsafe, and that write would have to become conditional too.
 
 **No operational surface.** Nothing lists the orders sitting in `needs_attention`, which makes a state that requires manual resolution useless in practice. It needs a filtered query and alerting on queue depth.
